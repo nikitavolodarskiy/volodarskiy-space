@@ -1,0 +1,94 @@
+---
+title: ElasticSearch Federated Query via Athena Connector
+description: Is it good? TL;DR no, not really :(
+datePublished: 2026-04-24 22:00:00+02:00
+---
+
+
+When you need Elasticsearch data in Athena for analytics, the Athena Federated Query connector looks like the obvious first choice – no pipelines, no exports, just SQL on top of live ES data. This post covers what we ran into when we tried it, so you don’t have to spend the time on a PoC yourself.
+
+## Context
+
+Our Elasticsearch cluster has a handful of indexes that the analytics team needs to query in Athena. The smallest is ~50 MB; others on the average around 13 GB each. ES is optimized for search, not analytics, and doesn’t integrate with Athena natively – so the federated connector is the most direct path to bridge that gap.
+
+## What Is Athena Federated Query
+
+Athena Federated Query lets you run SQL against external data sources without moving the data first. AWS maintains a set of Lambda-backed connectors for common sources: DynamoDB, RDS, Redis, and others. You deploy the connector as a Lambda function, register it as a data catalog in Athena, and then query it alongside your S3-based tables using standard SQL.
+
+For Elasticsearch and OpenSearch, AWS provides the [Amazon Athena connector for Elasticsearch/OpenSearch](https://docs.aws.amazon.com/athena/latest/ug/connectors-elasticsearch.html), available through the Serverless Application Repository (SAR).
+
+## Setup
+
+The connector is deployed from SAR with a handful of parameters:
+
+*   **ES endpoint** – the cluster URL
+    
+*   **Secret ARN** – credentials stored in AWS Secrets Manager (username/password or API key)
+    
+*   **Spill bucket and prefix** – S3 location used when query result sets exceed Lambda memory limits
+    
+*   **Lambda function name** – becomes your data catalog identifier in Athena
+    
+
+Once deployed, you register the Lambda as a data source in the Athena console under _Data sources → Connect data source → Lambda_. After that, the ES indexes appear as databases and tables within Athena – no schema definition required, since the connector infers it from ES mappings (But there is a twist, wait for it).
+
+## Two Connector Variants
+
+Two SAR applications exist for this connector:
+
+**AthenaElasticsearchConnector** – the standard variant. Connects to ES using the endpoint and credentials you provide. Straightforward to deploy and configure.
+
+**AthenaElasticsearchConnectorWithGlueConnection** – intended for setups where network connectivity is managed via a Glue Connection. This one could not be made to work. The likely cause is a known limitation documented by AWS:
+
+> _Due to a known issue, the OpenSearch connector cannot be used with a VPC._
+
+Since we connect to ES through a VPC, this variant is a dead end. All further testing used the standard connector.
+
+## Problems
+
+### Permissions
+
+A minor friction point, but worth calling out upfront. The IAM permissions required to deploy the connector and register the Athena catalog are spread across a few services – Lambda, Glue, Athena, S3, Secrets Manager, and IAM itself. Before starting, review the [permissions required to create a connector and Athena catalog](https://docs.aws.amazon.com/athena/latest/ug/athena-catalog-access.html) to avoid deploy failures mid-setup.
+
+### Schema Inference Errors
+
+Here is the twist!
+
+The connector infers the table schema directly from ES mappings at query time. This breaks when a field has inconsistent types across documents. For example, a field that is a single struct in some documents and an array in others.
+
+The critical detail: **the error triggers even when the problematic field is not selected in the query**. The connector deserializes the full document before applying column projection, so any type inconsistency anywhere in the index will surface as a query error.
+
+A partial workaround: create a Glue table manually with a schema that includes only the fields you need. The connector detects the Glue table and uses it as the schema, skipping deserialization of fields not listed. This works, but it adds ongoing maintenance overhead. Any new document with an inconsistent field on a column you do care about can still break queries unexpectedly.
+
+### Blank Values
+
+One of the indexes returned the correct number of rows, but all field values were empty. The data was present in ES – the connector deserialized the documents without error but produced no values. We did not dig into the root cause because the next issue...
+
+### Performance
+
+This was the deciding factor.
+
+Index sizes and query time:
+
+~50 MB (small) ~15 minutes
+
+~13 GB (can we call it large?) No result after 30 minutes
+
+Athena Federated Query works by pushing the query down to the Lambda connector, which fetches data from ES in batches, spills large intermediate results to S3, and returns them to Athena for final aggregation. For large indexes, the sheer volume of data flowing through this path is the bottleneck – ES is not built for full-scan analytics queries, and the connector does not change that.
+
+For a 50 MB index, 15 minutes is already unusable for an analytics workload. For 13 GB indexes, the connector did not complete within 30-minute, we decided not to wait longer.
+
+## Assessment
+
+The federated connector is the right idea: live data, no pipeline to maintain, minimal setup. In practice, it ran into too many failures for our use case:
+
+*   VPC incompatibility ruled out one of the two connector variants entirely
+    
+*   Schema inference errors required a manual Glue schema workaround, with fragile ongoing behavior
+    
+*   One index returned blank results with no clear path to debug
+    
+*   Query performance was 15 minutes on a 50 MB index and didn’t finish on 13 GB indexes
+    
+
+The connector may be viable for small, schema-consistent indexes where query latency requirements are loose. For anything larger or more complex, the performance characteristics make it unsuitable for production analytics use.

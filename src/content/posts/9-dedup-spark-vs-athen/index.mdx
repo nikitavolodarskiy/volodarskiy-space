@@ -1,0 +1,143 @@
+---
+title: Deduplication Spark vs Athena (Trino)
+description: Deduplicating 16 Billion Rows: Why Athena Failed and How Spark Didn't.
+datePublished: 2026-04-29 22:00:00+02:00
+---
+
+
+We had a table in Athena that grew enormously to 16 billion records, where only 6 billion records were unique. This happened because a join condition was incorrectly populating duplicates over a long period of time. After we fixed the underlying condition, we also needed to deduplicate the existing data to restore query performance.
+
+For context: it’s a Hive external table without partitions, stored as Parquet files on S3.
+
+## Athena
+
+We tried a couple of approaches to delete duplicates directly in Athena.
+
+### Row number window function
+
+The first approach was the standard one – use `ROW_NUMBER()` to rank rows per ID and keep only the latest:
+
+```sql
+SELECT * FROM (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY id ORDER BY last_modified DESC) AS rn
+  FROM data_lake.customer
+)
+WHERE rn = 1
+```
+
+It failed immediately with `Query exhausted resources`. Trino has [limited ability to spill to disk for window functions](https://trino.io/docs/current/admin/spill.html) and in practice, large window partitions frequently exhaust per-query memory.
+
+### Join-based approach
+
+A known workaround in Athena is to replace the window function with a self-join, which Trino can handle more efficiently:
+
+```sql
+WITH grouped_max AS (
+  SELECT id, MAX(last_modified) AS max_modified
+  FROM data_lake.customer
+  GROUP BY id
+)
+SELECT a.*
+FROM data_lake.customer a
+JOIN grouped_max b ON a.id = b.id AND a.last_modified = b.max_modified
+```
+
+This approach works well when duplicates differ by `last_modified`. In our case though, we had **complete duplicates** – rows where every column, including `last_modified`, was identical. The join would match all of them and return duplicates unchanged.
+
+We also tried `SELECT DISTINCT` and `GROUP BY` with `MAX`, but both hit the same `Query exhausted resources` wall. At 16 billion rows, Athena simply doesn’t have enough per-query memory to materialise the intermediate state any of these approaches require.
+
+So all Athena approaches were dead ends.
+
+## Spark
+
+We decided to run the deduplication in PySpark in local mode on a dedicated Kubernetes pod (16 vCPU, 120 GB RAM). We don’t have a Spark cluster, so local mode on a large pod was the pragmatic choice – no cluster overhead, no executor coordination, just one JVM with all available memory.
+
+The obvious approach, read the entire table and run a window function, also fails here for the same fundamental reason: shuffling 16 billion rows requires materialising all of them on a single machine, which no reasonable pod size can support.
+
+### Hash-partitioned batches
+
+The solution was to split the work into 32 independent buckets using a deterministic hash function:
+
+```sql
+pmod(xxhash64(id), 32) == bucket  # bucket in 0..31
+```
+
+`xxhash64` returns a signed 64-bit integer. `pmod` (positive modulo, as opposed to the `%` remainder operator) always produces a value in \[0, 31\] regardless of the sign of the hash. This is important – with the regular `%` operator, negative hash values produce negative remainders that never match any bucket, silently dropping roughly half of all IDs. `pmod` eliminates that.
+
+Because the hash is deterministic, all rows for a given `id` always land in exactly one bucket. This guarantees deduplication is complete – no ID can be split across jobs.
+
+Each of the 32 buckets ran as an independent job on a separate Kubernetes pod:
+
+```sql
+bucket_filter = F.pmod(F.xxhash64(F.col("id")), F.lit(32)) == bucket
+
+window = Window.partitionBy("id").orderBy(F.col("last_modified").desc())
+deduped = (
+    spark.read.parquet(source_path)
+    .filter(bucket_filter)
+    .withColumn("rn", F.row_number().over(window))
+    .filter(F.col("rn") == 1)
+    .drop("rn")
+)
+deduped.write.mode("append").parquet(destination_path)
+```
+
+Up to 8 buckets ran in parallel, each writing to the same output prefix in append mode.
+
+### Why didn’t scanning the full table cause OOM?
+
+Each job reads the entire 16B-row table to find its 1/32 slice. You’d expect that to cause memory problems – but it doesn’t.
+
+Spark reads Parquet in [columnar batches of 4096 rows by default](https://spark.apache.org/docs/latest/sql-data-sources-parquet.html#vectorized-reader). Within each batch, [whole-stage code generation](https://www.databricks.com/blog/2016/05/23/apache-spark-as-a-compiler-joining-a-billion-rows-per-second-on-a-laptop.html) fuses the scan and filter into a single compiled code path: rows that fail the predicate are skipped inline and never passed to the next operator as intermediate objects.
+
+Rows that pass the filter are buffered in memory. Periodically, Spark checks whether the task can still acquire memory from the execution pool. When it can’t, the buffer is sorted and spilled to a temporary file on local disk, freeing memory for the next batch. At the end of the scan, all spill files and any remaining buffer are merged into the final [shuffle output file](https://spark.apache.org/docs/latest/rdd-programming-guide.html#shuffle-operations).
+
+This is why memory doesn’t grow with table size: the read buffer is 4096 rows (by default), and the write buffer is kept bounded by the execution memory pool through incremental spills – not by the number of rows scanned. Disk accumulates the ~500M surviving rows for this bucket throughout the scan. Only once all map-side tasks are complete does [the stage barrier release](https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala) and the second phase begin.
+
+The two phases have different resource profiles:
+
+*   **Scan + shuffle write:** memory bounded by execution pool; disk accumulates ~500M rows
+    
+*   **Sort + window:** reads the shuffle files and sorts rows by id and last\_modified; the window operator then evaluates row-by-row over the sorted partitions
+    
+
+Per bucket, in our case ~500M rows fit comfortably within the 175 Gi ephemeral volume, with room for sort spill.. A single job on all 16B rows would produce ~32x more shuffle data on disk, well beyond 175 Gi, before the sort phase even starts.
+
+```
+Phase 1 – Scan + shuffle write:
+  S3 read -> 4096-row batches (vectorized reader)
+      -> filter: 31/32 rows dropped via WSCG inline code
+      -> survivors -> ExternalSorter (in-memory buffer)
+      -> buffer spills to disk when execution pool exhausted
+      -> repeat for all 16B rows
+      -> result: ~500M rows in shuffle files on local disk (~125 GB)
+
+Phase 2 – Sort + window:
+  [stage barrier: waits for all Phase 1 tasks to complete]
+  read shuffle files -> SortExec (UnsafeExternalSorter, spills if needed)
+      -> WindowExec: row-by-row over pre-sorted partitions
+      -> ROW_NUMBER, keep rn=1
+      -> write deduplicated rows to S3
+```
+
+## Could the batching approach work in Athena?
+
+The truth is, it may. After ruling out the straightforward approaches and learning more about how Athena handles spilling to disk, we decided Spark would be a better tool here. Too much data? No problem – just spill to disk and wait 2 hours for deduplication to happen.
+
+But if you still want to stay in Athena, you could try applying the same bucket filter there:
+
+```sql
+SELECT * FROM (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY last_modified DESC) AS rn
+  FROM data_lake.customer
+  WHERE abs(from_big_endian_64(xxhash64(to_utf8(cast(id AS varchar))))) % 32 = 0
+)
+WHERE rn = 1
+```
+
+Run it 32 times, once per bucket. or even try increasing the number of buckets.
+
+The unknowns are whether Athena’s [limited window function spill support](https://trino.io/docs/current/admin/spill.html) holds up under that load, whether shared worker memory leaves enough headroom for your bucket size, and whether you stay within the [30-minute query timeout](https://docs.aws.amazon.com/athena/latest/ug/service-limits.html) (though this one can be increased up to 240 min)
+
+It might just work. Give it a try and see.
