@@ -52,6 +52,12 @@
     "sanitize-html": "^2.17.0",
     "sharp": "^0.34.3"
   },
+  "pnpm": {
+    "supportedArchitectures": {
+      "os": ["linux", "darwin"],
+      "cpu": ["x64", "arm64"]
+    }
+  },
   "devDependencies": {
     "@axe-core/playwright": "^4.10.2",
     "@biomejs/biome": "^2.1.4",
